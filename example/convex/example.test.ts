@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { initConvexTest } from "./setup.test";
-import { api, components } from "./_generated/api";
+import { api, components, internal } from "./_generated/api";
 
 describe("example worker", () => {
   beforeEach(() => {
@@ -19,6 +19,35 @@ describe("example worker", () => {
 
     const totals = await t.query(api.example.getTotals, {});
     expect(totals).toEqual({ total: 5, count: 1, pending: 0 });
+  });
+
+  test("re-fetches changed events and skips deleted or already processed candidates", async () => {
+    const t = initConvexTest();
+    const ids = await t.run(async (ctx) => {
+      const first = await ctx.db.insert("events", {
+        value: 1,
+        insertedAt: ctx.db.vars.commitTs,
+      });
+      const second = await ctx.db.insert("events", {
+        value: 2,
+        insertedAt: ctx.db.vars.commitTs,
+      });
+      return [first, second];
+    });
+    const batch = await t.query(internal.example.getBatch, { name: "events" });
+    if (!batch.batch) throw new Error("Expected work");
+    // Explicitly create the gap between the query and mutation snapshots.
+    await t.run(async (ctx) => {
+      await ctx.db.patch("events", ids[0], { value: 10 });
+      await ctx.db.delete("events", ids[1]);
+    });
+    await t.mutation(internal.example.processBatch, batch.batch);
+    await t.mutation(internal.example.processBatch, batch.batch);
+    expect(await t.query(api.example.getTotals, {})).toEqual({
+      total: 10,
+      count: 1,
+      pending: 0,
+    });
   });
 
   test("batches many events across iterations", async () => {
