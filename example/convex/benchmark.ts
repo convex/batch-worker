@@ -100,12 +100,14 @@ export const patch = internalMutation({
   handler: async (ctx, { items }) => {
     // Intentionally assumes the query's values and eligibility are unchanged.
     // This is the comparison baseline, not the recommended general pattern.
-    for (const { id, value } of items) {
-      await ctx.db.patch("benchmarkItems", id, {
-        processed: true,
-        result: value + 1,
-      });
-    }
+    await Promise.all(
+      items.map(({ id, value }) =>
+        ctx.db.patch("benchmarkItems", id, {
+          processed: true,
+          result: value + 1,
+        }),
+      ),
+    );
     return items.length;
   },
 });
@@ -114,21 +116,24 @@ export const refetch = internalMutation({
   args: { ids: vIds },
   returns: v.number(),
   handler: async (ctx, { ids }) => {
-    // Fetch all candidates together, as in the application examples. Keep
-    // patches sequential and in the same order as the direct-patch baseline.
+    // Fetch all candidates together, then issue all eligible patches together.
+    // Both variants use Promise.all for writes, so the direct-patch baseline
+    // also has the opportunity to fetch its target rows concurrently.
     const rows = await Promise.all(
       ids.map((id) => ctx.db.get("benchmarkItems", id)),
     );
-    let processed = 0;
-    for (const row of rows) {
-      if (!row || row.processed) continue;
-      await ctx.db.patch("benchmarkItems", row._id, {
-        processed: true,
-        result: row.value + 1,
-      });
-      processed++;
-    }
-    return processed;
+    const eligible = rows.filter(
+      (row): row is NonNullable<typeof row> => row !== null && !row.processed,
+    );
+    await Promise.all(
+      eligible.map((row) =>
+        ctx.db.patch("benchmarkItems", row._id, {
+          processed: true,
+          result: row.value + 1,
+        }),
+      ),
+    );
+    return eligible.length;
   },
 });
 

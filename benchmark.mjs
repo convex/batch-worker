@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Query values -> sequential patches vs query IDs -> Promise.all gets -> sequential patches.
+// Query values -> Promise.all patches vs query IDs -> Promise.all gets -> Promise.all patches.
 // Usage: node benchmark.mjs [--trials 50] [--batch-sizes 1,25,100]
 import { spawn, execFile } from "node:child_process";
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
@@ -12,7 +12,10 @@ const { values } = parseArgs({
     warmups: { type: "string", default: "5" },
     "batch-sizes": { type: "string", default: "1,25,100" },
     "padding-bytes": { type: "string", default: "0,4096" },
-    output: { type: "string", default: ".context/benchmark-parallel-results" },
+    output: {
+      type: "string",
+      default: ".context/benchmark-parallel-patches-results",
+    },
   },
 });
 const env = parseEnv(readFileSync(".env.local", "utf8"));
@@ -211,7 +214,8 @@ try {
     runId,
     trials,
     warmups,
-    refetchStrategy: "Promise.all gets, sequential patches",
+    patchStrategy: "Promise.all patches",
+    refetchStrategy: "Promise.all gets, then Promise.all patches",
     convexVersion: JSON.parse(
       readFileSync("node_modules/convex/package.json", "utf8"),
     ).version,
