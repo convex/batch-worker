@@ -40,10 +40,11 @@ node benchmark.mjs
 ```
 
 This compares a snapshot query returning `{ id, value }` followed by direct
-patches against a snapshot query returning IDs followed by `db.get`, an
-eligibility check, and the same patches. Both paths use sequential patches. Only
-the fields needed for processing are passed through the batch; optional document
-padding measures the effect of larger stored rows.
+patches against a snapshot query returning IDs followed by `Promise.all` over
+the `db.get` calls, eligibility checks, and the same patches. Both paths use
+sequential patches in a `for` loop. Only the fields needed for processing are
+passed through the batch; optional document padding measures the effect of
+larger stored rows.
 
 The default run measures 50 paired trials after five warmup pairs for batches of
 1, 25, and 100 rows, with 0 or 4096 padding bytes per row. Trial order
@@ -53,11 +54,11 @@ outside the measured transaction. Fixtures live in a separate table and are
 deleted after each case. All benchmark functions are internal.
 
 Results and raw server completion logs are saved to
-`.context/benchmark-results/`. Server execution time includes the snapshot query
-and nested worker mutation, but excludes scheduling and network latency to the
-CLI. The action's `runMutation` round-trip timing is also recorded. This
-measures the overhead of re-fetching when rows have not changed; it does not
-simulate stale snapshots or measure conflict retries under load.
+`.context/benchmark-parallel-results/`. Server execution time includes the
+snapshot query and nested worker mutation, but excludes scheduling and network
+latency to the CLI. The action's `runMutation` round-trip timing is also
+recorded. This measures the overhead of re-fetching when rows have not changed;
+it does not simulate stale snapshots or measure conflict retries under load.
 
 For a shorter run or different batch sizes:
 

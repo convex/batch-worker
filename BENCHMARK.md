@@ -5,18 +5,54 @@ between selection and processing:
 
 - **Direct patch:** a snapshot query returns `{ id, value }`; the mutation
   trusts that value and patches `{ processed: true, result: value + 1 }`.
-- **Re-fetch:** a snapshot query returns IDs; the mutation calls `db.get` for
-  each ID, checks that the row exists and is unprocessed, then applies the same
-  patch using the current value.
+- **Re-fetch:** a snapshot query returns IDs; the mutation fetches the rows with
+  `Promise.all(ids.map(id => ctx.db.get(...)))`, then checks eligibility and
+  applies the same patches in a sequential `for` loop using current values.
 
 Both variants scan the same index, use `ctx.runQuery` with
 `useStaleSnapshot: true`, and invoke the worker through `ctx.runMutation` in the
 same outer mutation, matching the component's query/mutation calling pattern.
-Both use sequential patches; the re-fetch variant adds a sequential point read
-and eligibility check before each patch. Queries pass only fields needed for
-processing, so artificial document padding is not passed in mutation arguments.
+Both use sequential patches. Only the gets are parallelized, matching the
+application examples. Queries pass only fields needed for processing, so
+artificial document padding is not passed in mutation arguments.
 
-## Results
+## Results: parallel gets, sequential patches
+
+Measured on 2026-09-18 UTC (2026-09-17 PDT) on dev `enchanted-cardinal-63`. Both
+variants were measured afresh in this run. All 600 measured executions produced
+the expected results, with no reported OCC retries or execution errors. The
+benchmark table was confirmed empty after cleanup. Times are milliseconds per
+complete query-plus-mutation transaction.
+
+| Rows per batch | Padding per row | Direct patch mean | Parallel-get mean | Mean difference | Paired 95% interval |
+| -------------: | --------------: | ----------------: | ----------------: | --------------: | ------------------: |
+|              1 |             0 B |             16.13 |             15.72 |           -0.42 |      -2.08 to +1.25 |
+|             25 |             0 B |             98.30 |             48.71 |          -49.59 |    -70.46 to -28.72 |
+|            100 |             0 B |            337.08 |             94.90 |         -242.18 |  -351.62 to -132.74 |
+|              1 |          4096 B |             14.21 |             14.67 |           +0.46 |      -0.80 to +1.72 |
+|             25 |          4096 B |             79.72 |             31.44 |          -48.29 |    -53.01 to -43.56 |
+|            100 |          4096 B |            292.50 |             87.74 |         -204.77 |  -226.71 to -182.82 |
+
+With patches still sequential in both variants, parallel gets reduced mean
+server time by **50–61% for 25 rows** and **70–72% for 100 rows** in this run.
+All four of those paired intervals exclude zero. Single-row cases showed no
+clear difference. The medians also favor parallel gets: at 100 rows they were
+280.26 ms versus 79.95 ms without padding, and 285.47 ms versus 82.35 ms with
+4096 bytes of padding. The benchmark measures the complete transaction; it does
+not isolate the database-internal reason for the improvement.
+
+Run ID: `5b565bfd-2962-44b6-a408-856f1ef7b942`. Raw evidence is in
+`.context/benchmark-parallel-results/results.json`, `cases.json`, and
+`logs.jsonl`.
+
+## Earlier results: sequential gets
+
+The results below used the original implementation on dev `first-lobster-65`,
+which awaited one get and one patch at a time. They do not measure `Promise.all`
+gets. That implementation is available in commit `066836b`. Since the parallel
+run uses a different deployment, compare each re-fetch variant with its own
+direct-patch baseline; these runs do not isolate the speedup from changing
+sequential gets to parallel gets.
 
 Measured on 2026-09-18 UTC (2026-09-17 PDT). All 600 measured executions
 produced the expected results, with no reported OCC retries or execution errors.
@@ -38,7 +74,13 @@ mean difference: medians were 312.94 ms versus 318.41 ms, while p95 values were
 530.29 ms versus 994.53 ms. Its 21.9% mean increase should not be treated as a
 stable overhead estimate.
 
-Database usage was deterministic across trials:
+Run ID: `478bc6c6-a4f9-40f6-bd71-1f6c15fead8e`. Raw evidence is in
+`.context/benchmark-results/results.json`, `cases.json`, and `logs.jsonl`.
+
+## Database usage
+
+The read-document, read-byte, and write-byte measurements were identical in the
+parallel-get and sequential-get runs, and deterministic across trials:
 
 | Rows per batch | Padding per row | Direct patch read docs | Re-fetch read docs | Direct patch read bytes | Re-fetch read bytes | Write bytes, either variant |
 | -------------: | --------------: | ---------------------: | -----------------: | ----------------------: | ------------------: | --------------------------: |
@@ -54,18 +96,15 @@ for the full query-plus-mutation transaction**, with identical writes. This is a
 resource-usage measurement, not a claim of a 50% increase in total cost or
 latency. Byte counts include stored row fields and metadata, not just padding.
 
-Run ID: `478bc6c6-a4f9-40f6-bd71-1f6c15fead8e`. Raw evidence is in
-`.context/benchmark-results/results.json`, `cases.json`, and `logs.jsonl`.
-
 ## Method
 
-Run on the cloud dev deployment `first-lobster-65` with Convex JS 1.43.0. For
-each combination of batch size (1, 25, 100) and document padding (0, 4096
-bytes), discard five warmup pairs, then measure 50 paired trials with
-alternating variant order. This gives 600 measured executions plus 60 warmup
-executions. Each pair uses the same rows, reset before each variant, with no
-concurrent writers to those rows. All results are verified after every
-execution. Fixtures are scoped to each case and removed in a `finally` block.
+Both runs use Convex JS 1.43.0. For each combination of batch size (1, 25, 100)
+and document padding (0, 4096 bytes), discard five warmup pairs, then measure 50
+paired trials with alternating variant order. This gives 600 measured executions
+plus 60 warmup executions. Each pair uses the same rows, reset before each
+variant, with no concurrent writers to those rows. All results are verified
+after every execution. Fixtures are scoped to each case and removed in a
+`finally` block.
 
 Server time and database usage come from the outer mutation's Convex completion
 log. Time includes the snapshot query and nested mutation, but excludes fixture
@@ -90,10 +129,12 @@ The harness requires a dev deployment in `.env.local`. Configuration options are
 documented in
 [example/README.md](./example/README.md#benchmark-point-reads-before-patching).
 Machine-readable results, action timings, and raw server logs are written to
-`.context/benchmark-results/`.
+`.context/benchmark-parallel-results/`. The original sequential-get run is
+retained in `.context/benchmark-results/`.
 
-This is a warm, uncontended workload on one deployment. It does not benchmark
-cold database reads, scheduler throughput, simultaneous writers, or deliberately
-different snapshots. Re-fetching is needed for correctness when eligibility or
-values can change, regardless of its measured overhead here. The direct-patch
-variant is an intentional benchmark baseline, not general application guidance.
+Each run is a warm, uncontended workload on one deployment. It does not
+benchmark cold database reads, scheduler throughput, simultaneous writers, or
+deliberately different snapshots. Re-fetching is needed for correctness when
+eligibility or values can change, regardless of its measured overhead here. The
+direct-patch variant is an intentional benchmark baseline, not general
+application guidance.

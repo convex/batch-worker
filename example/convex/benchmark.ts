@@ -114,13 +114,15 @@ export const refetch = internalMutation({
   args: { ids: vIds },
   returns: v.number(),
   handler: async (ctx, { ids }) => {
+    // Fetch all candidates together, as in the application examples. Keep
+    // patches sequential and in the same order as the direct-patch baseline.
+    const rows = await Promise.all(
+      ids.map((id) => ctx.db.get("benchmarkItems", id)),
+    );
     let processed = 0;
-    // Match the baseline's sequential patch order, adding one point read and
-    // eligibility check per row. Both paths write exactly the same fields.
-    for (const id of ids) {
-      const row = await ctx.db.get("benchmarkItems", id);
+    for (const row of rows) {
       if (!row || row.processed) continue;
-      await ctx.db.patch("benchmarkItems", id, {
+      await ctx.db.patch("benchmarkItems", row._id, {
         processed: true,
         result: row.value + 1,
       });
