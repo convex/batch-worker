@@ -542,6 +542,11 @@ The demo is hosted on Convex itself via
 published to `https://<deployment>.convex.site`. See
 [example/README.md](./example/README.md#deploy) for the deploy commands.
 
+For a real-deployment comparison of returning values and patching directly
+versus returning IDs and re-fetching before patching, see
+[the benchmark results](./BENCHMARK.md) and
+[how to run the benchmark](./example/README.md#benchmark-point-reads-before-patching).
+
 ### How it works
 
 | Table         | Written by                          | Read by                 |

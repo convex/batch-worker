@@ -60,4 +60,13 @@ export default defineSchema({
     oldestLatencyMs: v.number(),
     newestLatencyMs: v.number(),
   }),
+
+  // Isolated fixtures for benchmark.mjs; each run cleans up its own rows.
+  benchmarkItems: defineTable({
+    runId: v.string(),
+    value: v.number(),
+    padding: v.string(),
+    processed: v.boolean(),
+    result: v.optional(v.number()),
+  }).index("by_runId_processed", ["runId", "processed"]),
 });

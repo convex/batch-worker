@@ -9,6 +9,7 @@
  */
 
 import type * as aggregates from "../aggregates.js";
+import type * as benchmark from "../benchmark.js";
 import type * as e2e from "../e2e.js";
 import type * as example from "../example.js";
 import type * as rateLimited from "../rateLimited.js";
@@ -21,6 +22,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   aggregates: typeof aggregates;
+  benchmark: typeof benchmark;
   e2e: typeof e2e;
   example: typeof example;
   rateLimited: typeof rateLimited;
