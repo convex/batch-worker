@@ -97,6 +97,10 @@ export type BatchQueryArgs<Cursor = DefaultCursor> = {
  * explicit `idle` (optionally with a `timeoutMs` hint for when to check again
  * — e.g. when the next item is scheduled).
  *
+ * The query may read an older snapshot than the worker mutation. Treat the
+ * batch as candidates: re-fetch by ID and validate current state in the mutation
+ * unless the application explicitly tolerates processing older values.
+ *
  * Alongside a batch, return a `cursor` saying how far this batch got. The
  * component commits it with the batch, and hands it back as `args.cursor` on
  * the next call so the scan resumes there. It is committed only if the worker

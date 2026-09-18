@@ -61,7 +61,9 @@ export const loop = internalMutation({
     >;
 
     // Stale snapshot read: no OCC dependency, so concurrent inserts while we
-    // drain don't force this loop to retry. If the query or worker mutation
+    // drain don't force this loop to retry. The query's snapshot may be older
+    // than the worker mutation's; the worker must validate candidate rows when
+    // it needs current state. If the query or worker mutation
     // throws, this loop fails (and doesn't reschedule) — the monitor restarts
     // it.
     const result = await ctx.runQuery(queryRef, queryArgs, {
