@@ -41,9 +41,11 @@ export type {
  *  - a **worker mutation** that processes a batch and owns its cleanup. It may
  *    return `{ debounceMs }` to throttle the loop.
  *
- * The work query may read an older snapshot than the worker mutation. Return
- * candidate IDs and re-fetch them in the mutation when processing depends on
- * current values or state. A write by ID does not validate the query's values.
+ * The work query may read an older snapshot than the worker mutation, but each
+ * round sees this worker's committed writes from previous rounds. Return IDs
+ * and re-fetch them when processing depends on changes by other writers;
+ * otherwise, values can be passed through the batch. A write by ID does not
+ * validate the query's values.
  *
  * Validate both with {@link defineBatchWorkerValidators}. The cursor type is
  * taken from the work query's `cursor` arg, and both return types are checked

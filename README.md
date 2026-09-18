@@ -126,9 +126,9 @@ export const processBatch = internalMutation({
   args: vMutationArgs,
   handler: async (ctx, { ids }) => {
     for (const id of ids) {
-      // The query may have read an older snapshot. Check the current row.
+      // Re-fetch if other mutations may edit or delete queued events.
       const event = await ctx.db.get("events", id);
-      if (!event) continue; // already processed or deleted
+      if (!event) continue; // deleted by another mutation
       // ... do the work using event.value (sum, schedule downstream jobs, etc.) ...
 
       // Clean up the work you processed.
@@ -143,13 +143,17 @@ The component **does not clean up your work for you** — your worker mutation i
 responsible for deleting (or marking complete / advancing past) the rows it
 processed, otherwise the next query will return them again.
 
-### Find work in the query, validate it in the mutation
+### Find work in the query, process it in the mutation
 
 Treat the work query and the worker mutation as **two separate transactions**.
-The query may read an older database snapshot than the mutation. There is **no
-guarantee that the rows or values returned by the query are still current** when
-the mutation runs: rows may have changed, been deleted, or already been
-processed.
+The query may read an older database snapshot than the mutation, but **each
+round's query sees the committed writes from this worker's previous rounds**. If
+a batch deletes rows or marks them started, the next query observes those
+changes, so it can exclude that work from its results.
+
+Other mutations can still change, delete, or claim rows between the query's
+snapshot and the worker mutation's snapshot. Revalidate in the mutation when
+processing depends on those concurrent changes.
 
 - The **work query** runs as a snapshot read that takes **no read
   dependencies**. It can scan the queue (`.take(BATCH_SIZE)` over an index)
@@ -157,23 +161,27 @@ processed.
 - The **worker mutation** is a normal transaction: every range it reads becomes
   a read dependency. If it re-queries the range of work in the queue, concurrent
   inserts would conflict. Keep queue scans in the query and use point reads by
-  `_id` to validate selected rows in the mutation.
+  `_id` when selected rows need revalidation in the mutation.
 
-The default pattern is to **return IDs from the query, then re-fetch those rows
-in the mutation**. Check that each row still exists and is eligible for work
-(for example, `state === "pending"`), and compute updates from its current
-values. Skip rows that have already been processed. These point reads
-participate in the mutation's conflict detection without adding a dependency on
-the whole queue.
+If other writers can change the work, **return IDs from the query, then re-fetch
+those rows in the mutation**. Check that each row still exists and is eligible
+for work (for example, `state === "pending"`), and compute updates from its
+current values. These point reads participate in the mutation's conflict
+detection without adding a dependency on the whole queue.
 
-You can pass values through `batch` when your application can safely process
-older values, such as immutable, append-only events tracked with an exclusive
-cursor. Document that assumption. Patching a row by `_id` takes a dependency in
-the mutation's snapshot; it **does not validate values from the query's older
-snapshot** or establish that the row is still eligible for processing.
+You can **pass values directly through `batch`** when they cannot change before
+processing, or when your application can safely process older values. For
+example, if events are immutable until this worker processes and deletes them,
+and no other consumer edits or deletes them, there is no need to re-fetch just
+to check for deletes from earlier rounds. If events are retained, an exclusive
+cursor can track which ones have been processed. Document these assumptions.
+
+Patching a row by `_id` takes a dependency in the mutation's snapshot; it **does
+not validate values from the query's older snapshot** or establish that another
+writer has left the row eligible for processing.
 
 ```ts
-// Query: find candidate rows without adding queue-wide read dependencies.
+// When other writers can change the work, return IDs for revalidation.
 return {
   kind: "work" as const,
   batch: { ids: rows.map((row) => row._id) },
@@ -181,7 +189,7 @@ return {
 ```
 
 ```ts
-// Mutation: validate each candidate in the snapshot used for the writes.
+// Mutation: check for concurrent changes before applying effects.
 for (const id of ids) {
   const row = await ctx.db.get("tasks", id);
   if (!row || row.state !== "pending") continue;
@@ -390,9 +398,13 @@ The worker mutation is a transaction, so it can't call external APIs itself. To
 batch work that requires `fetch`— calling an LLM, hitting a third-party API —
 have the worker mutation _claim_ a batch: re-fetch the candidate IDs, check that
 each row is still pending, and mark those rows started. Then schedule the
-action, or enqueue it in a Workpool, using only the rows actually claimed. A
-stale query can return previously claimed rows, so the mutation must skip them.
-The action does the work and calls a mutation to commit the results back.
+action, or enqueue it in a Workpool, using only the rows actually claimed. The
+next round's query sees this worker's claims and excludes those rows from its
+pending results. Re-fetching protects against other mutations changing or
+claiming requests between snapshots; if this worker is the only consumer and
+pending requests cannot change, it can claim them using values passed through
+`batch`. The action does the work and calls a mutation to commit the results
+back.
 
 Full working code is in [rateLimited.ts](./example/convex/rateLimited.ts). It
 also rate-limits the batches, covered next.
@@ -447,11 +459,12 @@ Tips for rate-limiting LLM calls:
 If your work query or worker mutation throws, the loop dies and the liveness
 monitor restarts it after ~`monitorLagMs`. The failed mutation's writes and
 cursor advance roll back, so the query retries from the previous cursor. Its
-next batch may differ because it can read a different snapshot. Design for
-repeated delivery and re-check rows in the mutation before applying effects. One
-poison item that always throws can wedge the queue. For work that can fail per
-item, catch errors inside the worker mutation, and isolate bad docs in a table
-for async debugging.
+next batch may differ because other mutations can change the work before the
+retry. Successful batches' committed writes remain visible to later rounds, so
+their cleanup is not lost on retry. Re-check rows if other writers can change
+them. One poison item that always throws can wedge the queue. For work that can
+fail per item, catch errors inside the worker mutation, and isolate bad docs in
+a table for async debugging.
 
 This is a low-level primitive, relative to components like Workpool or Workflow,
 so you have to handle exceptional cases yourself.

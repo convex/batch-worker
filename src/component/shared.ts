@@ -97,9 +97,10 @@ export type BatchQueryArgs<Cursor = DefaultCursor> = {
  * explicit `idle` (optionally with a `timeoutMs` hint for when to check again
  * — e.g. when the next item is scheduled).
  *
- * The query may read an older snapshot than the worker mutation. Treat the
- * batch as candidates: re-fetch by ID and validate current state in the mutation
- * unless the application explicitly tolerates processing older values.
+ * The query may read an older snapshot than the worker mutation, but each round
+ * sees this worker's committed writes from previous rounds. Re-fetch by ID when
+ * processing depends on changes by other writers. Values can be passed through
+ * when they cannot change before processing or older values are acceptable.
  *
  * Alongside a batch, return a `cursor` saying how far this batch got. The
  * component commits it with the batch, and hands it back as `args.cursor` on

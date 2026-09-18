@@ -74,8 +74,8 @@ export const processBatch = internalMutation({
   args: vMutationArgs,
   returns: vMutationReturns,
   handler: async (ctx, { ids }) => {
-    // The query can read an older snapshot. Use current values and skip rows
-    // already deleted by a previous batch or another mutation.
+    // Re-fetch to handle edits or deletes by other mutations between snapshots.
+    // The query already sees this worker's deletes from previous rounds.
     const candidates = await Promise.all(
       ids.map((id) => ctx.db.get("events", id)),
     );

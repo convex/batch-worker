@@ -13,10 +13,13 @@ All three drain their queue by returning a `v.commitTs()` cursor from the work
 query. The component commits it with the batch and hands it back on the next
 call, so each scan resumes where the last one stopped.
 
-The work query may read an older snapshot than the worker mutation. The queue
-and LLM examples return IDs and re-fetch current rows in the mutation, skipping
-deleted or already-claimed work. The scoreboard passes values directly because
-its score events are immutable and its exclusive cursor tracks processed events.
+The work query may read an older snapshot than the worker mutation, but each
+round sees this worker's committed writes from previous rounds, including
+deletes and claims. The queue and LLM examples return IDs and re-fetch current
+rows to handle edits, deletes, or claims by other mutations between snapshots.
+If only this worker can change or remove queued work, values can be passed
+directly through the batch. The scoreboard does this because its score events
+are immutable and its exclusive cursor tracks processed events.
 
 Run all commands from the **root of the repo**.
 

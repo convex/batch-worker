@@ -68,8 +68,8 @@ export const submitRequest = mutation({
   },
 });
 
-// Return candidate IDs. The mutation checks current state and reads the prompt
-// and token estimate from its own snapshot before claiming each request.
+// Return IDs so the mutation can check for changes by other mutations before
+// claiming each request, using its current prompt and token estimate.
 const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
   defineBatchWorkerValidators({ batch: { ids: v.array(v.id("llmRequests")) } });
 
@@ -113,7 +113,8 @@ export const startBatch = internalMutation({
   args: vMutationArgs,
   returns: vMutationReturns,
   handler: async (ctx, { ids }) => {
-    // A stale query can return requests already claimed, finished, or deleted.
+    // Other mutations may have changed, claimed, or deleted these requests
+    // since the query's snapshot. This worker's prior claims are already visible.
     const candidates = await Promise.all(
       ids.map((id) => ctx.db.get("llmRequests", id)),
     );
@@ -132,7 +133,7 @@ export const startBatch = internalMutation({
     });
 
     // Claim only requests that are still pending in this mutation's snapshot.
-    // Previously claimed or deleted candidates can also be passed by the cursor.
+    // The next round's query sees these claims and excludes them from pending.
     // Patches refresh `updatedAt` too, so the "started" range stays in claim
     // order for the recovery scan sketched in getBatch's TODO.
     const startedAt = Date.now();
