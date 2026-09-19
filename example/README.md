@@ -39,25 +39,27 @@ npx convex dev --once
 node benchmark.mjs
 ```
 
-This compares a snapshot query returning `{ id, value }` followed by direct
-patches against a snapshot query returning IDs followed by one `Promise.all`
-over async tasks that each get a row, check eligibility, and patch it. Each task
-can patch its row as soon as its get finishes; there is no wait for all gets to
-complete before patches start. The baseline also uses `Promise.all` for its
-patches. Only the fields needed for processing are passed through the batch;
-optional document padding measures the effect of larger stored rows.
+This compares three variants: `{ id, value }` followed by direct patches, IDs
+followed by re-fetch/check/patch, and `{ id, value }` followed by the same
+re-fetch/check/patch logic. The third variant controls for query return values
+and mutation arguments: it receives the same payload as direct patch but ignores
+the supplied values. Re-fetching uses one `Promise.all` over async tasks that
+each get a row, check eligibility, and patch it. The baseline also patches with
+`Promise.all`. Full documents and artificial padding are never passed through
+the batch; padding only changes the size of stored rows.
 
-The default run measures 50 paired trials after five warmup pairs for batches of
-1, 25, and 100 rows, with 0 or 4096 padding bytes per row. Trial order
-alternates. There are no concurrent writers, and every trial verifies that all
-rows received identical results. Setup, reset, verification, and cleanup are
-outside the measured transaction. Fixtures live in a separate table and are
-deleted after each case. All benchmark functions are internal.
+The default run measures 50 matched trials after five warmup trials for batches
+of 1, 25, and 100 rows, with 0 or 4096 padding bytes per row. Each trial runs
+all three variants, cycling through all six orders, for 900 measured executions.
+There are no concurrent writers, and every trial verifies that all rows received
+identical results. Setup, reset, verification, and cleanup are outside the
+measured transaction. Fixtures live in a separate table and are deleted after
+each case. All benchmark functions are internal.
 
 Results and raw server completion logs are saved to
-`.context/benchmark-interleaved-results/`. Server execution time includes the
-snapshot query and nested worker mutation, but excludes scheduling and network
-latency to the CLI. The action's `runMutation` round-trip timing is also
+`.context/benchmark-payload-control-results/`. Server execution time includes
+the snapshot query and nested worker mutation, but excludes scheduling and
+network latency to the CLI. The action's `runMutation` round-trip timing is also
 recorded. This measures the overhead of re-fetching when rows have not changed;
 it does not simulate stale snapshots or measure conflict retries under load.
 

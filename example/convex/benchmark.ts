@@ -1,9 +1,10 @@
-import { v } from "convex/values";
+import { v, type Infer } from "convex/values";
 import { internal } from "./_generated/api.js";
 import {
   internalAction,
   internalMutation,
   internalQuery,
+  type MutationCtx,
 } from "./_generated/server.js";
 import type { Id } from "./_generated/dataModel.js";
 
@@ -13,7 +14,12 @@ const vIds = v.array(v.id("benchmarkItems"));
 const vItems = v.array(
   v.object({ id: v.id("benchmarkItems"), value: v.number() }),
 );
-const vMode = v.union(v.literal("patch"), v.literal("refetch"));
+const vMode = v.union(
+  v.literal("patch"),
+  v.literal("refetch"),
+  v.literal("refetchValues"),
+);
+type Mode = Infer<typeof vMode>;
 const vCase = {
   runId: v.string(),
   batchSize: v.number(),
@@ -112,25 +118,39 @@ export const patch = internalMutation({
   },
 });
 
+async function refetchRows(ctx: MutationCtx, ids: Id<"benchmarkItems">[]) {
+  // Each concurrent task gets, checks, and patches one row. A patch can start
+  // as soon as that row is ready, without waiting for every get to finish.
+  const processed = await Promise.all(
+    ids.map(async (id) => {
+      const row = await ctx.db.get("benchmarkItems", id);
+      if (!row || row.processed) return 0;
+      await ctx.db.patch("benchmarkItems", id, {
+        processed: true,
+        result: row.value + 1,
+      });
+      return 1;
+    }),
+  );
+  return processed.reduce<number>((sum, count) => sum + count, 0);
+}
+
 export const refetch = internalMutation({
   args: { ids: vIds },
   returns: v.number(),
-  handler: async (ctx, { ids }) => {
-    // Each concurrent task gets, checks, and patches one row. A patch can start
-    // as soon as that row is ready, without waiting for every get to finish.
-    const processed = await Promise.all(
-      ids.map(async (id) => {
-        const row = await ctx.db.get("benchmarkItems", id);
-        if (!row || row.processed) return 0;
-        await ctx.db.patch("benchmarkItems", id, {
-          processed: true,
-          result: row.value + 1,
-        });
-        return 1;
-      }),
-    );
-    return processed.reduce<number>((sum, count) => sum + count, 0);
-  },
+  handler: async (ctx, { ids }) => await refetchRows(ctx, ids),
+});
+
+export const refetchValues = internalMutation({
+  // Same validator and payload as patch; supplied values are intentionally
+  // ignored so the re-fetch logic is identical to the IDs-only variant.
+  args: { items: vItems },
+  returns: v.number(),
+  handler: async (ctx, { items }) =>
+    await refetchRows(
+      ctx,
+      items.map(({ id }) => id),
+    ),
 });
 
 export const iteration = internalMutation({
@@ -146,11 +166,16 @@ export const iteration = internalMutation({
       `batch-read-bench|${runId}|${batchSize}|${paddingBytes}|${trial}|${mode}|${warmup}`,
     );
     const args = { runId, batchSize };
-    if (mode === "patch") {
+    if (mode === "patch" || mode === "refetchValues") {
       const items = await ctx.runQuery(internal.benchmark.batchValues, args, {
         useStaleSnapshot: true,
       });
-      return await ctx.runMutation(internal.benchmark.patch, { items });
+      return await ctx.runMutation(
+        mode === "patch"
+          ? internal.benchmark.patch
+          : internal.benchmark.refetchValues,
+        { items },
+      );
     }
     const ids = await ctx.runQuery(internal.benchmark.batchIds, args, {
       useStaleSnapshot: true,
@@ -195,18 +220,24 @@ export const run = internalAction({
     boundedInteger(trials, 1, 100);
     boundedInteger(warmups, 0, 20);
     const samples: {
-      mode: "patch" | "refetch";
+      mode: Mode;
       trial: number;
       elapsedMs: number;
     }[] = [];
     try {
       const ids = await ctx.runMutation(internal.benchmark.seed, spec);
+      // Cycle all six orders to balance position and preceding-variant effects.
+      const orders: Mode[][] = [
+        ["patch", "refetch", "refetchValues"],
+        ["refetch", "refetchValues", "patch"],
+        ["refetchValues", "patch", "refetch"],
+        ["refetchValues", "refetch", "patch"],
+        ["refetch", "patch", "refetchValues"],
+        ["patch", "refetchValues", "refetch"],
+      ];
       for (let trial = -warmups; trial < trials; trial++) {
-        // Alternate which variant runs first to reduce drift/order bias.
         const modes =
-          trial % 2 === 0
-            ? (["patch", "refetch"] as const)
-            : (["refetch", "patch"] as const);
+          orders[((trial % orders.length) + orders.length) % orders.length];
         for (const mode of modes) {
           await ctx.runMutation(internal.benchmark.reset, { ids });
           // Date.now advances in actions; it is fixed inside mutations. Server

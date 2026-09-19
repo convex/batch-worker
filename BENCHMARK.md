@@ -1,6 +1,6 @@
 # Re-fetching before patching
 
-This benchmark compares two ways of processing a batch when no rows change
+This benchmark compares three ways of processing a batch when no rows change
 between selection and processing:
 
 - **Direct patch:** a snapshot query returns `{ id, value }`; the mutation
@@ -9,6 +9,13 @@ between selection and processing:
 - **Re-fetch:** a snapshot query returns IDs; one `Promise.all` wraps async
   tasks that each get a row, check eligibility, and apply the same patch using
   its current value.
+- **Re-fetch with values:** the same query and `{ items: [{ id, value }] }`
+  mutation arguments as direct patch, but supplied values are ignored. It uses
+  the same re-fetch helper as the IDs-only variant. This control keeps the query
+  return values and mutation arguments identical to direct patch.
+
+None of these variants passes full documents. Even the original direct-patch
+baseline passed only `{ id, value }`; document padding stays in the database.
 
 The re-fetch mutation processes each ID like this:
 
@@ -27,15 +34,68 @@ const processed = await Promise.all(
 return processed.reduce<number>((sum, count) => sum + count, 0);
 ```
 
-Both variants scan the same index, use `ctx.runQuery` with
+All variants scan the same index, use `ctx.runQuery` with
 `useStaleSnapshot: true`, and invoke the worker through `ctx.runMutation` in the
 same outer mutation, matching the component's query/mutation calling pattern.
-Both variants issue work concurrently. Each re-fetch task can patch as soon as
+All variants issue work concurrently. Each re-fetch task can patch as soon as
 its own get and check finish; there is no barrier waiting for all gets to
 complete. Queries pass only fields needed for processing, so artificial document
 padding is not passed in mutation arguments.
 
-## Results: one Promise.all over get, check, and patch
+## Results: control for the query and mutation payload
+
+Measured on 2026-09-19 UTC (2026-09-18 PDT) on dev `enchanted-cardinal-63`. All
+three variants were measured together in 50 matched trials per case, with all
+six execution orders cycled. All 900 measured executions produced the expected
+results, with no reported OCC retries or execution errors. The benchmark table
+was confirmed empty after cleanup. Means below are milliseconds per complete
+query-plus-mutation transaction.
+
+| Rows per batch | Padding per row | Values → patch | IDs → re-fetch/patch | Values → re-fetch/patch |
+| -------------: | --------------: | -------------: | -------------------: | ----------------------: |
+|              1 |             0 B |          18.83 |                16.63 |                   26.91 |
+|             25 |             0 B |         107.17 |                40.31 |                   41.98 |
+|            100 |             0 B |         342.30 |                98.92 |                  123.54 |
+|              1 |          4096 B |          16.89 |                16.46 |                   16.72 |
+|             25 |          4096 B |         103.29 |                39.61 |                   40.67 |
+|            100 |          4096 B |         388.43 |               106.36 |                  114.60 |
+
+Two paired comparisons test the payload hypothesis. The first holds the payload
+constant and adds re-fetching. The second holds re-fetching constant and changes
+the payload from IDs to `{ id, value }`. That comparison includes constructing
+and validating the payload and extracting IDs in the control mutation; it is not
+an isolated serialization measurement:
+
+| Rows | Padding | Re-fetch minus patch, identical payload (mean) | Paired 95% interval | Values minus IDs, both re-fetch (mean) | Paired 95% interval |
+| ---: | ------: | ---------------------------------------------: | ------------------: | -------------------------------------: | ------------------: |
+|    1 |     0 B |                                          +8.08 |     -3.38 to +19.54 |                                 +10.28 |     -1.82 to +22.38 |
+|   25 |     0 B |                                         -65.19 |    -77.92 to -52.47 |                                  +1.67 |      -4.80 to +8.15 |
+|  100 |     0 B |                                        -218.76 |  -275.85 to -161.67 |                                 +24.61 |    -18.80 to +68.03 |
+|    1 |  4096 B |                                          -0.17 |      -2.70 to +2.36 |                                  +0.26 |      -2.20 to +2.73 |
+|   25 |  4096 B |                                         -62.62 |    -77.95 to -47.29 |                                  +1.07 |      -5.94 to +8.07 |
+|  100 |  4096 B |                                        -273.83 |  -311.09 to -236.57 |                                  +8.24 |     -7.17 to +23.65 |
+
+With identical query results and mutation arguments, re-fetching still reduced
+mean server time by **about 61% for 25 rows** and **64–71% for 100 rows**. All
+four paired intervals exclude zero. The payload difference therefore does not
+explain the large speedup in this workload.
+
+Every interval for the payload-only comparison includes zero; this run does not
+establish a consistent latency penalty for passing values. It does not prove
+zero overhead either. Means are noisy: at 100 rows without padding, re-fetching
+with values had a mean 24.61 ms above IDs-only, but their medians were 91.55 ms
+and 89.02 ms respectively. The direct-patch median was 307.50 ms. The
+measurements still do not identify the backend cache, I/O, or scheduling reason
+for the remaining difference. Full-document payloads are not tested here.
+
+Run ID: `b5b845ca-810a-422e-a541-f86d8b17ac03`. Raw evidence is in
+`.context/benchmark-payload-control-results/results.json`, `cases.json`, and
+`logs.jsonl`. The JSON includes all three paired comparisons and action timings.
+
+## Earlier results: one Promise.all over get, check, and patch
+
+This run compared only direct patch with IDs-only re-fetching, as implemented in
+commit `5fdba09`.
 
 Measured on 2026-09-19 UTC (2026-09-18 PDT) on dev `enchanted-cardinal-63`. Both
 variants were measured afresh. All 600 measured executions produced the expected
@@ -177,7 +237,8 @@ Run ID: `478bc6c6-a4f9-40f6-bd71-1f6c15fead8e`. Raw evidence is in
 ## Database usage
 
 The read-document, read-byte, and write-byte measurements were identical in all
-four runs, and deterministic across trials:
+five runs, and deterministic across trials. In the payload-control run, both
+re-fetch variants have the same usage shown in the re-fetch columns:
 
 | Rows per batch | Padding per row | Direct patch read docs | Re-fetch read docs | Direct patch read bytes | Re-fetch read bytes | Write bytes, either variant |
 | -------------: | --------------: | ---------------------: | -----------------: | ----------------------: | ------------------: | --------------------------: |
@@ -196,10 +257,13 @@ latency. Byte counts include stored row fields and metadata, not just padding.
 ## Method
 
 All runs use Convex JS 1.43.0. For each combination of batch size (1, 25, 100)
-and document padding (0, 4096 bytes), discard five warmup pairs, then measure 50
-paired trials with alternating variant order. This gives 600 measured executions
-plus 60 warmup executions. Each pair uses the same rows, reset before each
-variant, with no concurrent writers to those rows. All results are verified
+and document padding (0, 4096 bytes), discard five warmup trials, then measure
+50 matched trials. The current payload-control run executes all three variants
+in each trial, cycling through all six orders to balance position and
+preceding-variant effects. This gives 900 measured executions plus 90 warmup
+executions. Earlier runs used two variants in alternating order, giving 600
+measured executions plus 60 warmups. Each trial uses the same rows, reset before
+each variant, with no concurrent writers to those rows. All results are verified
 after every execution. Fixtures are scoped to each case and removed in a
 `finally` block.
 
@@ -210,9 +274,12 @@ and network latency to the CLI. The harness separately records the action's
 `runMutation` round-trip time. No timers run inside mutations, where
 `Date.now()` is fixed.
 
-Paired differences are re-fetch minus direct patch. The reported 95% intervals
-use a normal approximation from the standard error of the paired differences;
-they describe variation within this run, not variation across deployments.
+Paired differences are computed within each trial. Comparisons are re-fetch
+minus direct patch, re-fetch with values minus direct patch (identical
+payloads), and re-fetch with values minus IDs-only re-fetch (identical worker
+logic). The reported 95% intervals use a normal approximation from the standard
+error of the paired differences; they describe variation within this run, not
+variation across deployments.
 
 ## Reproduce
 
@@ -226,7 +293,8 @@ The harness requires a dev deployment in `.env.local`. Configuration options are
 documented in
 [example/README.md](./example/README.md#benchmark-point-reads-before-patching).
 Machine-readable results, action timings, and raw server logs are written to
-`.context/benchmark-interleaved-results/`. Earlier runs are retained in
+`.context/benchmark-payload-control-results/`. Earlier runs are retained in
+`.context/benchmark-interleaved-results/` (per-row get/check/patch with IDs),
 `.context/benchmark-parallel-patches-results/` (all parallel gets, then all
 parallel patches), `.context/benchmark-parallel-results/` (parallel gets,
 sequential patches), and `.context/benchmark-results/` (sequential gets and

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Query values -> Promise.all patches vs query IDs -> Promise.all(get -> check -> patch).
+// Compare parallel patches with per-row get/check/patch, controlling query payload.
 // Usage: node benchmark.mjs [--trials 50] [--batch-sizes 1,25,100]
 import { spawn, execFile } from "node:child_process";
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
@@ -14,7 +14,7 @@ const { values } = parseArgs({
     "padding-bytes": { type: "string", default: "0,4096" },
     output: {
       type: "string",
-      default: ".context/benchmark-interleaved-results",
+      default: ".context/benchmark-payload-control-results",
     },
   },
 });
@@ -47,8 +47,9 @@ const exec = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const events = [];
 const cases = [];
+const modes = ["patch", "refetch", "refetchValues"];
 const tagPattern =
-  /batch-read-bench\|([\w-]+)\|(\d+)\|(\d+)\|(-?\d+)\|(patch|refetch)\|(true|false)/;
+  /batch-read-bench\|([\w-]+)\|(\d+)\|(\d+)\|(-?\d+)\|(patch|refetch|refetchValues)\|(true|false)/;
 
 function completions() {
   const unique = new Map();
@@ -96,8 +97,25 @@ function summarize(samples) {
   };
 }
 
+function pairedDifference(a, b) {
+  const diffs = a.map((e, i) => (e.executionTime - b[i].executionTime) * 1000);
+  const mean = stats(diffs).mean;
+  const se =
+    trials > 1
+      ? Math.sqrt(
+          diffs.reduce((sum, d) => sum + (d - mean) ** 2, 0) /
+            (trials - 1) /
+            trials,
+        )
+      : null;
+  return {
+    mean,
+    normalApprox95CI: se === null ? null : [mean - 1.96 * se, mean + 1.96 * se],
+  };
+}
+
 console.log(
-  `Target: dev (${deployment}); ${trials} paired trials, ${warmups} warmup pairs per case.`,
+  `Target: dev (${deployment}); ${trials} matched trials, ${warmups} warmup trials per case; ${modes.length} variants per trial.`,
 );
 const logProcess = spawn(
   process.execPath,
@@ -147,7 +165,7 @@ try {
       );
     }
   }
-  const expected = cases.length * trials * 2;
+  const expected = cases.length * trials * modes.length;
   const deadline = Date.now() + 30000;
   while (
     completions().filter((e) => !e.warmup && !e.error && !e.willRetry).length <
@@ -170,34 +188,26 @@ try {
     const refetch = samples
       .filter((e) => e.mode === "refetch")
       .sort((a, b) => a.trial - b.trial);
-    for (const rows of [patch, refetch]) {
+    const refetchValues = samples
+      .filter((e) => e.mode === "refetchValues")
+      .sort((a, b) => a.trial - b.trial);
+    for (const rows of [patch, refetch, refetchValues]) {
       if (rows.length !== trials || rows.some((e, i) => e.trial !== i))
         throw new Error("Missing or duplicated trial logs");
     }
-    const diffs = refetch.map(
-      (e, i) => (e.executionTime - patch[i].executionTime) * 1000,
-    );
-    const mean = stats(diffs).mean;
-    const se =
-      trials > 1
-        ? Math.sqrt(
-            diffs.reduce((sum, d) => sum + (d - mean) ** 2, 0) /
-              (trials - 1) /
-              trials,
-          )
-        : null;
     return {
       batchSize: spec.batchSize,
       paddingBytes: spec.paddingBytes,
       patch: summarize(patch),
       refetch: summarize(refetch),
-      pairedDifferenceMs: {
-        mean,
-        normalApprox95CI:
-          se === null ? null : [mean - 1.96 * se, mean + 1.96 * se],
+      refetchValues: summarize(refetchValues),
+      pairedDifferencesMs: {
+        refetchMinusPatch: pairedDifference(refetch, patch),
+        refetchValuesMinusPatch: pairedDifference(refetchValues, patch),
+        refetchValuesMinusRefetch: pairedDifference(refetchValues, refetch),
       },
       actionRoundTripMs: Object.fromEntries(
-        ["patch", "refetch"].map((mode) => [
+        modes.map((mode) => [
           mode,
           stats(
             spec.actionSamples
@@ -214,8 +224,16 @@ try {
     runId,
     trials,
     warmups,
+    modes,
+    trialOrder: "Cycle all six permutations of the three variants",
     patchStrategy: "Promise.all patches",
     refetchStrategy: "Promise.all of per-row get, check, then patch",
+    payloads: {
+      patch: "Query { id, value }[]; mutation { items }",
+      refetch: "Query Id[]; mutation { ids }",
+      refetchValues:
+        "Query { id, value }[]; mutation { items }, ignore supplied values and re-fetch",
+    },
     convexVersion: JSON.parse(
       readFileSync("node_modules/convex/package.json", "utf8"),
     ).version,
@@ -230,8 +248,8 @@ try {
       batch: r.batchSize,
       padding: r.paddingBytes,
       "patch mean ms": r.patch.executionMs.mean.toFixed(3),
-      "refetch mean ms": r.refetch.executionMs.mean.toFixed(3),
-      "difference ms": r.pairedDifferenceMs.mean.toFixed(3),
+      "IDs refetch mean ms": r.refetch.executionMs.mean.toFixed(3),
+      "values refetch mean ms": r.refetchValues.executionMs.mean.toFixed(3),
       "patch reads": r.patch.readDocuments.mean,
       "refetch reads": r.refetch.readDocuments.mean,
     })),
