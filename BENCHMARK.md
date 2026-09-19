@@ -6,21 +6,76 @@ between selection and processing:
 - **Direct patch:** a snapshot query returns `{ id, value }`; the mutation
   trusts that value and uses `Promise.all` to patch all rows with
   `{ processed: true, result: value + 1 }`.
-- **Re-fetch:** a snapshot query returns IDs; the mutation fetches the rows with
-  `Promise.all(ids.map(id => ctx.db.get(...)))`, then checks eligibility and
-  applies the same patches with another `Promise.all` using current values.
+- **Re-fetch:** a snapshot query returns IDs; one `Promise.all` wraps async
+  tasks that each get a row, check eligibility, and apply the same patch using
+  its current value.
+
+The re-fetch mutation processes each ID like this:
+
+```ts
+const processed = await Promise.all(
+  ids.map(async (id) => {
+    const row = await ctx.db.get("benchmarkItems", id);
+    if (!row || row.processed) return 0;
+    await ctx.db.patch("benchmarkItems", id, {
+      processed: true,
+      result: row.value + 1,
+    });
+    return 1;
+  }),
+);
+return processed.reduce<number>((sum, count) => sum + count, 0);
+```
 
 Both variants scan the same index, use `ctx.runQuery` with
 `useStaleSnapshot: true`, and invoke the worker through `ctx.runMutation` in the
 same outer mutation, matching the component's query/mutation calling pattern.
-Both variants issue patches concurrently. The re-fetch variant awaits all gets
-before validating rows and issuing its patches. This gives the direct-patch
-baseline the opportunity to fetch its target rows concurrently too, removing the
-sequential-write bottleneck in the previous comparison. Queries pass only fields
-needed for processing, so artificial document padding is not passed in mutation
-arguments.
+Both variants issue work concurrently. Each re-fetch task can patch as soon as
+its own get and check finish; there is no barrier waiting for all gets to
+complete. Queries pass only fields needed for processing, so artificial document
+padding is not passed in mutation arguments.
 
-## Results: parallel patches in both variants
+## Results: one Promise.all over get, check, and patch
+
+Measured on 2026-09-19 UTC (2026-09-18 PDT) on dev `enchanted-cardinal-63`. Both
+variants were measured afresh. All 600 measured executions produced the expected
+results, with no reported OCC retries or execution errors. The benchmark table
+was confirmed empty after cleanup. Times are milliseconds per complete
+query-plus-mutation transaction.
+
+| Rows per batch | Padding per row | Parallel patches mean | Per-row get/check/patch mean | Mean difference | Paired 95% interval |
+| -------------: | --------------: | --------------------: | ---------------------------: | --------------: | ------------------: |
+|              1 |             0 B |                 13.19 |                        13.22 |           +0.03 |      -0.95 to +1.01 |
+|             25 |             0 B |                 67.52 |                        28.27 |          -39.26 |    -46.34 to -32.17 |
+|            100 |             0 B |                263.39 |                        74.57 |         -188.82 |  -221.30 to -156.34 |
+|              1 |          4096 B |                 15.06 |                        15.58 |           +0.52 |      -1.44 to +2.49 |
+|             25 |          4096 B |                 84.73 |                        28.79 |          -55.94 |    -69.30 to -42.57 |
+|            100 |          4096 B |                256.46 |                        83.98 |         -172.48 |  -187.61 to -157.35 |
+
+Re-fetching reduced mean server time by **58–66% for 25 rows** and **67–72% for
+100 rows** in this run. All four paired intervals exclude zero. Single-row cases
+showed no clear difference. For 100 rows, medians were 241.65 ms versus 66.91 ms
+without padding and 244.84 ms versus 80.35 ms with padding. The separately
+recorded action round-trip timings also favor re-fetching for all multi-row
+cases.
+
+The lower latency persists when each row's get, check, and patch share a single
+async callback. It therefore does not require an explicit barrier waiting for
+every get before starting any patches. Re-fetching still adds an explicit get
+and one reported document read per row, with identical writes. These
+measurements do not explain why the additional work has lower latency: they do
+not identify the backend's cache behavior, actual I/O, or internal scheduling.
+The earlier two-phase version was measured in a separate run, so the difference
+between its timings and these timings is not a paired comparison of the two
+re-fetch arrangements.
+
+Run ID: `9f50beef-4b63-4bea-8290-b0c6561a6a90`. Raw evidence is in
+`.context/benchmark-interleaved-results/results.json`, `cases.json`, and
+`logs.jsonl`.
+
+## Earlier results: all parallel gets, then all parallel patches
+
+This run used the two-phase implementation in commit `93b2ab5`.
 
 Measured on 2026-09-18 on dev `enchanted-cardinal-63`. Both variants were
 measured afresh with `Promise.all` for writes. The re-fetch variant first awaits
@@ -57,7 +112,7 @@ Run ID: `79cc3d5a-a89f-43ef-95e1-9b774fc46beb`. Raw evidence is in
 ## Earlier results: parallel gets, sequential patches
 
 This run used sequential patches in both variants, as implemented in commit
-`97ab116`. Its speedup does not establish the overhead of re-fetching compared
+`a3d37cc`. Its speedup does not establish the overhead of re-fetching compared
 with direct patches that also run in parallel.
 
 Measured on 2026-09-18 UTC (2026-09-17 PDT) on dev `enchanted-cardinal-63`. Both
@@ -91,7 +146,7 @@ Run ID: `5b565bfd-2962-44b6-a408-856f1ef7b942`. Raw evidence is in
 
 The results below used the original implementation on dev `first-lobster-65`,
 which awaited one get and one patch at a time. They do not measure `Promise.all`
-gets. That implementation is available in commit `066836b`. Since the parallel
+gets. That implementation is available in commit `c8a3d5c`. Since the parallel
 run uses a different deployment, compare each re-fetch variant with its own
 direct-patch baseline; these runs do not isolate the speedup from changing
 sequential gets to parallel gets.
@@ -122,7 +177,7 @@ Run ID: `478bc6c6-a4f9-40f6-bd71-1f6c15fead8e`. Raw evidence is in
 ## Database usage
 
 The read-document, read-byte, and write-byte measurements were identical in all
-three runs, and deterministic across trials:
+four runs, and deterministic across trials:
 
 | Rows per batch | Padding per row | Direct patch read docs | Re-fetch read docs | Direct patch read bytes | Re-fetch read bytes | Write bytes, either variant |
 | -------------: | --------------: | ---------------------: | -----------------: | ----------------------: | ------------------: | --------------------------: |
@@ -171,9 +226,11 @@ The harness requires a dev deployment in `.env.local`. Configuration options are
 documented in
 [example/README.md](./example/README.md#benchmark-point-reads-before-patching).
 Machine-readable results, action timings, and raw server logs are written to
-`.context/benchmark-parallel-patches-results/`. Earlier runs are retained in
-`.context/benchmark-parallel-results/` (parallel gets, sequential patches) and
-`.context/benchmark-results/` (sequential gets and patches).
+`.context/benchmark-interleaved-results/`. Earlier runs are retained in
+`.context/benchmark-parallel-patches-results/` (all parallel gets, then all
+parallel patches), `.context/benchmark-parallel-results/` (parallel gets,
+sequential patches), and `.context/benchmark-results/` (sequential gets and
+patches).
 
 Each run is a warm, uncontended workload on one deployment. It does not
 benchmark cold database reads, scheduler throughput, simultaneous writers, or

@@ -116,24 +116,20 @@ export const refetch = internalMutation({
   args: { ids: vIds },
   returns: v.number(),
   handler: async (ctx, { ids }) => {
-    // Fetch all candidates together, then issue all eligible patches together.
-    // Both variants use Promise.all for writes, so the direct-patch baseline
-    // also has the opportunity to fetch its target rows concurrently.
-    const rows = await Promise.all(
-      ids.map((id) => ctx.db.get("benchmarkItems", id)),
-    );
-    const eligible = rows.filter(
-      (row): row is NonNullable<typeof row> => row !== null && !row.processed,
-    );
-    await Promise.all(
-      eligible.map((row) =>
-        ctx.db.patch("benchmarkItems", row._id, {
+    // Each concurrent task gets, checks, and patches one row. A patch can start
+    // as soon as that row is ready, without waiting for every get to finish.
+    const processed = await Promise.all(
+      ids.map(async (id) => {
+        const row = await ctx.db.get("benchmarkItems", id);
+        if (!row || row.processed) return 0;
+        await ctx.db.patch("benchmarkItems", id, {
           processed: true,
           result: row.value + 1,
-        }),
-      ),
+        });
+        return 1;
+      }),
     );
-    return eligible.length;
+    return processed.reduce<number>((sum, count) => sum + count, 0);
   },
 });
 
