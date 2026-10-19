@@ -13,7 +13,23 @@ import {
   type Config,
   type DefaultCursor,
   type WorkerResult,
+  type WorkpoolConfig,
 } from "../component/shared.js";
+
+/**
+ * The portion of a Workpool instance used by BatchWorker. Kept structural so
+ * scheduler-only users don't need to install Workpool, even for its types.
+ * Requires a Workpool version supporting `onFailure`.
+ */
+export type BatchWorkpool = {
+  component: {
+    lib: {
+      enqueue: FunctionReference<"mutation", "internal">;
+      cancel: FunctionReference<"mutation", "internal">;
+    };
+  };
+  options: Pick<WorkpoolConfig, "maxParallelism" | "logLevel">;
+};
 
 export {
   defineBatchWorkerValidators,
@@ -85,17 +101,41 @@ export async function ping<
     >;
     /** Loop configuration. */
     config?: Partial<Config>;
+    /**
+     * Execute each iteration in this shared Workpool. Batches are fetched
+     * only when admitted. Omit to use the scheduler directly.
+     * Failures retry via onFailure; direct pool cancellations need `lib.kick`.
+     */
+    workpool?: BatchWorkpool;
   },
 ): Promise<void> {
   const [workQuery, workerMutation] = await Promise.all([
     createFunctionHandle(args.workQuery),
     createFunctionHandle(args.workerMutation),
   ]);
+  let workpool: WorkpoolConfig | undefined;
+  if (args.workpool) {
+    const [enqueue, cancel] = await Promise.all([
+      createFunctionHandle(args.workpool.component.lib.enqueue),
+      createFunctionHandle(args.workpool.component.lib.cancel),
+    ]);
+    workpool = {
+      enqueue,
+      cancel,
+      ...(args.workpool.options.maxParallelism !== undefined
+        ? { maxParallelism: args.workpool.options.maxParallelism }
+        : {}),
+      ...(args.workpool.options.logLevel !== undefined
+        ? { logLevel: args.workpool.options.logLevel }
+        : {}),
+    };
+  }
   await ctx.runMutation(component.lib.ping, {
     name: args.name,
     workQuery,
     workerMutation,
     config: args.config ?? {},
+    ...(workpool ? { workpool } : {}),
   });
 }
 

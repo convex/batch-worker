@@ -8,7 +8,7 @@ import {
   start as startHelper,
   stop as stopHelper,
 } from "./kick.js";
-import { vConfig, vStatus } from "./shared.js";
+import { vConfig, vStatus, vWorkpool } from "./shared.js";
 
 /**
  * The public component API. Apps call `ping` from `@convex-dev/batch-worker`
@@ -23,6 +23,7 @@ export const ping = mutation({
     workQuery: v.string(),
     workerMutation: v.string(),
     config: v.optional(vConfig.partial()),
+    workpool: v.optional(vWorkpool),
   },
   returns: v.null(),
   handler: async (ctx, args) => pingHelper(ctx, args),

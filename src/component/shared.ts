@@ -6,6 +6,16 @@ import {
   type VCommitTs,
   type Validator,
 } from "convex/values";
+import { logLevel } from "./logging.js";
+
+/** Capabilities for a sibling Workpool, passed as handles by the client. */
+export const vWorkpool = v.object({
+  enqueue: v.string(),
+  cancel: v.string(),
+  maxParallelism: v.optional(v.number()),
+  logLevel: v.optional(logLevel),
+});
+export type WorkpoolConfig = Infer<typeof vWorkpool>;
 
 export const MS = 1;
 export const SECOND = 1000 * MS;
@@ -40,6 +50,8 @@ export const vConfig = v.object({
    * monitor restarts the loop if it didn't run (and push the monitor back) by
    * then — this is also the effective retry cadence when the work query or
    * worker mutation throws.
+   * With a Workpool, no monitor is scheduled; this controls the delay before
+   * retrying a failed iteration (still at least 10 seconds).
    */
   monitorLagMs: v.number(),
 });

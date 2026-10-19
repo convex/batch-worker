@@ -41,7 +41,7 @@ export const loop = internalMutation({
       return; // worker was deleted
     }
 
-    if (state.generation !== generation) {
+    if (state.generation !== generation || worker.status.kind === "stopped") {
       ctx.log.debug(
         `[loop] "${name}" superseded (gen ${generation} !== ${state.generation})`,
       );
@@ -62,8 +62,8 @@ export const loop = internalMutation({
 
     // Stale snapshot read: no OCC dependency, so concurrent inserts while we
     // drain don't force this loop to retry. If the query or worker mutation
-    // throws, this loop fails (and doesn't reschedule) — the monitor restarts
-    // it.
+    // throws, this loop fails (and doesn't reschedule) — the monitor or the
+    // Workpool onFailure callback restarts it.
     const result = await ctx.runQuery(queryRef, queryArgs, {
       useStaleSnapshot: true,
     });

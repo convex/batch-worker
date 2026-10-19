@@ -15,6 +15,7 @@ import type * as logging from "../logging.js";
 import type * as loop from "../loop.js";
 import type * as monitor from "../monitor.js";
 import type * as shared from "../shared.js";
+import type * as workpool from "../workpool.js";
 
 import type {
   ApiFromModules,
@@ -31,6 +32,7 @@ const fullApi: ApiFromModules<{
   loop: typeof loop;
   monitor: typeof monitor;
   shared: typeof shared;
+  workpool: typeof workpool;
 }> = anyApi as any;
 
 /**

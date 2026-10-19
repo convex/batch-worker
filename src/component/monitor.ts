@@ -29,6 +29,11 @@ export const monitor = internalMutation({
     }
 
     const state = await getOrCreateWorkerState(ctx, worker);
+    // A monitor scheduled before switching to a pool must not restart its job.
+    if (worker.workpool) {
+      await cancelMonitor(ctx, state);
+      return;
+    }
     const loop =
       state.runnerId &&
       (await ctx.db.system.get("_scheduled_functions", state.runnerId));

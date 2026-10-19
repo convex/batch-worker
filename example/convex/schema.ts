@@ -2,6 +2,24 @@ import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
 export default defineSchema({
+  executionBenchmarks: defineTable({
+    name: v.string(),
+    runId: v.string(),
+    mode: v.union(v.literal("busy"), v.literal("poll")),
+    startedAt: v.number(),
+    deadline: v.number(),
+    pollIntervalMs: v.number(),
+  }).index("name", ["name"]),
+  // Independent per-user queues sharing one Workpool (see pooled.ts).
+  userEvents: defineTable({
+    user: v.string(),
+    value: v.number(),
+    insertedAt: v.commitTs(),
+  }).index("user_insertedAt", ["user", "insertedAt"]),
+  userTotals: defineTable({ user: v.string(), total: v.number() }).index(
+    "user",
+    ["user"],
+  ),
   // A simple work queue: each row is one event to be summed.
   //
   // `insertedAt` is written as `ctx.db.vars.commitTs` and resolves, when the

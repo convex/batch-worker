@@ -8,7 +8,9 @@ import {
   MONITOR_REFRESH_WITHIN_MS,
   RUNNING_THRESHOLD_MS,
   MONITOR_LAG_MS,
+  type WorkpoolConfig,
 } from "./shared.js";
+import { cancelWorkpoolJob, enqueueLoop } from "./workpool.js";
 
 export async function getWorker(ctx: QueryCtx, name: string) {
   return ctx.db
@@ -48,6 +50,7 @@ export async function ping(
     workQuery: string;
     workerMutation: string;
     config?: Partial<Config> | undefined;
+    workpool?: WorkpoolConfig | undefined;
   },
 ): Promise<void> {
   const worker = await getWorker(ctx, args.name);
@@ -62,6 +65,7 @@ export async function ping(
       workQuery: args.workQuery,
       workerMutation: args.workerMutation,
       config: args.config ?? {},
+      ...(args.workpool ? { workpool: args.workpool } : {}),
       status: { kind: "running" },
       stateId,
     });
@@ -71,7 +75,9 @@ export async function ping(
     return;
   }
 
+  const poolChanged = !sameWorkpool(worker.workpool, args.workpool);
   if (
+    poolChanged ||
     args.workQuery !== worker.workQuery ||
     args.workerMutation !== worker.workerMutation ||
     (args.config &&
@@ -80,16 +86,47 @@ export async function ping(
   ) {
     worker.workQuery = args.workQuery;
     worker.workerMutation = args.workerMutation;
+    if (args.workpool) worker.workpool = args.workpool;
+    else delete worker.workpool;
     if (args.config) {
       worker.config = args.config;
     }
     await ctx.db.replace("workers", worker._id, worker);
+  }
+  if (poolChanged) {
+    const state = await getOrCreateWorkerState(ctx, worker);
+    const scheduled =
+      state.runnerId &&
+      (await ctx.db.system.get("_scheduled_functions", state.runnerId));
+    const runAt =
+      state.workpoolJob?.runAt ?? scheduled?.scheduledTime ?? Date.now();
+    await cancelLoop(ctx, state);
+    await cancelMonitor(ctx, state);
+    if (
+      worker.status.kind !== "stopped" &&
+      (state.runnerId || state.workpoolJob || worker.status.kind === "running")
+    ) {
+      // Preserve debounce/timeout eligibility while moving an active worker.
+      // An idle worker's ping below may still interrupt its wait.
+      await scheduleLoopRun(ctx, worker, {
+        delayMs: Math.max(0, runAt - Date.now()),
+      });
+    }
   }
   if (worker.status.kind !== "idle") {
     ctx.log.debug(`[ping] "${worker.name}" ${worker.status.kind} — no-op`);
     return;
   }
   await wake(ctx, worker);
+}
+
+function sameWorkpool(a?: WorkpoolConfig, b?: WorkpoolConfig): boolean {
+  return (
+    a?.enqueue === b?.enqueue &&
+    a?.cancel === b?.cancel &&
+    a?.maxParallelism === b?.maxParallelism &&
+    a?.logLevel === b?.logLevel
+  );
 }
 
 /**
@@ -117,7 +154,7 @@ export async function kick(ctx: MutationCtx, name: string): Promise<void> {
   const worker = await getWorker(ctx, name);
   if (!worker) return;
   const state = await getOrCreateWorkerState(ctx, worker);
-  if (state.runnerId) await cancelIfPending(ctx, state.runnerId);
+  await cancelLoop(ctx, state);
   // Clear the monitor state so scheduleLoopRun arms a fresh monitor even if
   // monitorRunAtMs still looks healthy.
   await cancelMonitor(ctx, state);
@@ -126,20 +163,14 @@ export async function kick(ctx: MutationCtx, name: string): Promise<void> {
 }
 
 /**
- * Stop the worker: cancel its loop and monitor and mark it idle.
+ * Stop the worker: cancel its loop and monitor and mark it stopped.
  * Only `start` will resume it.
  */
 export async function stop(ctx: MutationCtx, name: string): Promise<void> {
   const worker = await getWorker(ctx, name);
   if (!worker) return;
   const state = await getOrCreateWorkerState(ctx, worker);
-  if (state?.runnerId) {
-    await cancelIfPending(ctx, state.runnerId);
-    await ctx.db.patch("workerState", state._id, {
-      runnerId: undefined,
-      generation: state.generation + 1n,
-    });
-  }
+  await cancelLoop(ctx, state);
   await cancelMonitor(ctx, state);
   await ctx.db.patch("workers", worker._id, { status: { kind: "stopped" } });
 }
@@ -158,26 +189,29 @@ async function wake(ctx: MutationCtx, worker: Doc<"workers">): Promise<void> {
   const loop =
     state.runnerId &&
     (await ctx.db.system.get("_scheduled_functions", state.runnerId));
+  const runAt =
+    state.workpoolJob?.runAt ??
+    (loop?.state.kind === "pending" ? loop.scheduledTime : undefined);
   // Possibly wait for a debounce window before running
   const delayMs = worker.config.debounceMs ?? DEFAULT_CONFIG.debounceMs;
   await ctx.db.patch("workers", worker._id, { status: { kind: "running" } });
   // Rescheduling would run at `now + delayMs`; if the pending run is already
   // sooner than that (or imminent), canceling it would only delay work.
   if (
-    loop?.state.kind === "pending" &&
-    loop.scheduledTime < now + Math.max(delayMs, RUNNING_THRESHOLD_MS)
+    runAt !== undefined &&
+    runAt < now + Math.max(delayMs, RUNNING_THRESHOLD_MS)
   ) {
     ctx.log.debug(
       `[wake] "${worker.name}" already scheduled to run sooner — keeping it`,
     );
     // The kept run gets a fresh cooldown window too.
     await ctx.db.patch("workerState", state._id, {
-      lastWorkTs: Math.max(state.lastWorkTs, loop.scheduledTime),
+      lastWorkTs: Math.max(state.lastWorkTs, runAt),
     });
     return;
   }
   ctx.log.debug(`[wake] "${worker.name}" interrupting wait`);
-  if (loop) await cancelIfPending(ctx, loop._id);
+  if (state.runnerId || state.workpoolJob) await cancelLoop(ctx, state);
   await scheduleLoopRun(ctx, worker, { delayMs, lastWorkTs: now + delayMs });
 }
 
@@ -229,6 +263,7 @@ export async function goIdle(
   await ctx.db.patch("workerState", state._id, {
     generation: state.generation + 1n,
     runnerId: undefined,
+    workpoolJob: undefined,
   });
   await cancelMonitor(ctx, state);
   await ctx.db.patch("workers", worker._id, { status: { kind: "idle" } });
@@ -245,22 +280,48 @@ async function scheduleLoopRun(
 ): Promise<void> {
   const state = await getOrCreateWorkerState(ctx, worker);
   const generation = state.generation + 1n;
-  const runnerId = await ctx.scheduler.runAfter(
-    opts.delayMs,
-    internal.loop.loop,
-    { name: worker.name, generation },
-  );
+  const runAt = Date.now() + opts.delayMs;
+  let runnerId: Id<"_scheduled_functions"> | undefined;
+  let workpoolJob: Doc<"workerState">["workpoolJob"];
+  if (worker.workpool) {
+    const id = await enqueueLoop(
+      ctx,
+      worker.workpool,
+      { name: worker.name, generation },
+      runAt,
+    );
+    workpoolJob = { id, runAt, cancel: worker.workpool.cancel };
+  } else {
+    runnerId = await ctx.scheduler.runAfter(opts.delayMs, internal.loop.loop, {
+      name: worker.name,
+      generation,
+    });
+  }
   // The cursor rides along on the patch this already does every iteration.
   // `undefined` leaves the stored cursor as it was.
   await ctx.db.patch("workerState", state._id, {
     generation,
     runnerId,
+    workpoolJob,
     ...(opts.lastWorkTs !== undefined ? { lastWorkTs: opts.lastWorkTs } : {}),
     ...(opts.cursor !== undefined ? { cursor: opts.cursor } : {}),
   });
 
-  // await ctx.db.patch("workers", worker._id, { status: worker.status });
-  await ensureMonitored(ctx, worker, Date.now() + opts.delayMs);
+  if (!worker.workpool) await ensureMonitored(ctx, worker, runAt);
+}
+
+/** Invalidation is transactional even if Workpool already admitted the job. */
+async function cancelLoop(
+  ctx: MutationCtx,
+  state: Doc<"workerState">,
+): Promise<void> {
+  if (state.runnerId) await cancelIfPending(ctx, state.runnerId);
+  if (state.workpoolJob) await cancelWorkpoolJob(ctx, state.workpoolJob);
+  await ctx.db.patch("workerState", state._id, {
+    runnerId: undefined,
+    workpoolJob: undefined,
+    generation: state.generation + 1n,
+  });
 }
 
 // ── Monitor ────────────────────────────────────────────────────────────────
@@ -276,6 +337,7 @@ export async function ensureMonitored(
   worker: Doc<"workers">,
   loopRunAtMs: number,
 ): Promise<void> {
+  if (worker.workpool) return;
   const state = await ctx.db.get("workerState", worker.stateId);
   if (!state) return;
 
