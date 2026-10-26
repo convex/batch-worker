@@ -33,10 +33,8 @@ export const addEvent = mutation({
   },
 });
 
-const vEvent = v.object({ id: v.id("events"), value: v.number() });
-
 const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
-  defineBatchWorkerValidators({ batch: { events: v.array(vEvent) } });
+  defineBatchWorkerValidators({ batch: { ids: v.array(v.id("events")) } });
 
 /**
  * The work query: returns the next batch of work, or `idle` when the queue is
@@ -59,7 +57,7 @@ export const getBatch = internalQuery({
     }
     return {
       kind: "work" as const,
-      batch: { events: events.map((e) => ({ id: e._id, value: e.value })) },
+      batch: { ids: events.map((e) => e._id) },
       // Rows come back in commit order, so the last one is how far we got.
       // The component commits this with the batch and hands it back above.
       cursor: events.at(-1)!.insertedAt,
@@ -75,7 +73,14 @@ export const getBatch = internalQuery({
 export const processBatch = internalMutation({
   args: vMutationArgs,
   returns: vMutationReturns,
-  handler: async (ctx, { events }) => {
+  handler: async (ctx, { ids }) => {
+    // Re-fetch to handle edits or deletes by other mutations between snapshots.
+    // The query already sees this worker's deletes from previous rounds.
+    const candidates = await Promise.all(
+      ids.map((id) => ctx.db.get("events", id)),
+    );
+    const events = candidates.filter((event) => event !== null);
+    if (events.length === 0) return null;
     const sum = events.reduce((a, e) => a + e.value, 0);
     const totals = await ctx.db
       .query("totals")
@@ -93,8 +98,8 @@ export const processBatch = internalMutation({
         count: events.length,
       });
     }
-    for (const { id } of events) {
-      await ctx.db.delete("events", id);
+    for (const { _id } of events) {
+      await ctx.db.delete("events", _id);
     }
   },
 });

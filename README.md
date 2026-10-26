@@ -44,14 +44,12 @@ import { defineApp } from "convex/server";
 import batchWorker from "@convex-dev/batch-worker/convex.config.js";
 
 const app = defineApp();
-app.use(batchWorker, { env: { LOG_LEVEL: "REPORT" } });
+app.use(batchWorker);
 
 export default app;
 ```
 
-The `env` option is optional, defaults shown above. The default mount name is
-`batchWorker` (i.e. `components.batchWorker`). This works inside another
-component too: call `component.use(batchWorker)` in your component's
+For components, call `component.use(batchWorker)` in your component's
 `convex.config.ts`.
 
 ## Usage
@@ -59,8 +57,7 @@ component too: call `component.use(batchWorker)` in your component's
 Insert work into your own table, then call `ping`. Provide a query that returns
 the next batch or `idle`, and a mutation that processes it. To ensure that the
 batch shape always matches between the query and the mutation, use
-`defineBatchWorkerValidators` to obtain all four argument and return validators.
-(`kind: "work"` is optional — returning `{ batch }` alone also works.)
+`defineBatchWorkerValidators` to obtain argument and return validators.
 
 Alongside the batch, the query returns a **cursor** saying how far it got. The
 component commits it with the batch and hands it back as `args.cursor` next
@@ -90,12 +87,8 @@ export const addEvent = mutation({
   },
 });
 
-const vEvents = v.array(v.object({ id: v.id("events"), value: v.number() }));
-
-// One declaration gives the query's args (`{ name, cursor? }`) and returns,
-// plus the mutation's args. `cursor` defaults to a commit timestamp.
-const { vQueryArgs, vQueryReturns, vMutationArgs } =
-  defineBatchWorkerValidators({ batch: { events: vEvents } });
+const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
+  defineBatchWorkerValidators({ batch: { ids: v.array(v.id("events")) } });
 
 // Return the next batch of work, or `idle` when there's nothing to do.
 export const getBatch = internalQuery({
@@ -114,63 +107,78 @@ export const getBatch = internalQuery({
     }
     return {
       kind: "work" as const,
-      batch: { events: events.map((e) => ({ id: e._id, value: e.value })) },
+      batch: { ids: events.map((e) => e._id) },
       // Rows come back in commit order, so the last one is how far we got.
       cursor: events.at(-1)!.insertedAt,
     };
   },
 });
 
-// Process one batch. The worker owns cleanup — delete what you process!
+// Process one batch.
 export const processBatch = internalMutation({
   args: vMutationArgs,
-  handler: async (ctx, { events }) => {
-    for (const { value, id } of events) {
-      // ... do the work (sum, call an API, schedule downstream jobs, etc.) ...
+  returns: vMutationReturns,
+  handler: async (ctx, { ids }) => {
+    for (const id of ids) {
+      // Re-fetch if other mutations may edit or delete queued events.
+      const event = await ctx.db.get("events", id);
+      if (!event) continue; // deleted by another mutation
+      // ... do the work (sum, schedule downstream jobs, etc.)
 
-      // Clean up the work you processed.
+      // Important: clean up processed work to exclude it from the next query.
       await ctx.db.delete("events", id);
     }
-    // Returning nothing re-runs immediately to drain the rest.
+    // Returning nothing re-runs the query for the next batch immediately.
   },
 });
 ```
 
-The component **does not clean up your work for you** — your worker mutation is
-responsible for deleting (or marking complete / advancing past) the rows it
-processed, otherwise the next query will return them again.
+### Find work in the query, process it in the mutation
 
-### Fetch work in the query, process it in the mutation
-
-Think of the work query and the worker mutation as **two separate transactions**
-(under the hood they run against the same database snapshot, but they behave
-independently for conflict purposes). This split enables concurrent processing
-without database conflicts on work being added while being fetched.
+The Batch Worker splits up work into a query and mutation in order to isolate
+reads which are likely to conflict from the processing of those documents. For
+example, reading a range of documents to process while new documents are being
+inserted.
 
 - The **work query** runs as a snapshot read that takes **no read
-  dependencies**. It can scan the queue (`.take(BATCH_SIZE)` over an index)
+  dependencies**. It can scan a queue (`.take(BATCH_SIZE)` over an index)
   alongside concurrent inserts.
-- The **worker mutation** is a normal transaction: every range it reads becomes
-  a read dependency. If it re-queries the range of work in the queue, concurrent
-  inserts would conflict, so do range reads in the work query only.
+- The **worker mutation** is a normal transaction: every read is tracked to
+  detect write conflicts. Because of this, it's advised to keep range scans in
+  the query and use point reads (`db.get`) in the mutation to catch conflicting
+  writes to the specific documents processed without conflicting on the whole
+  query's **range**.
 
-So: **fetch the batch in the query, and pass everything the mutation needs
-through `batch`**, so the mutation doesn't need to re-fetch it. Note: when the
-mutation updates rows by `_id`, it will depend on those documents, so it is
-protected against concurrent changes to those documents.
+In general, treat the work query and the worker mutation as **two separate
+transactions**[^1]. In the future they may read from different database
+snapshots, meaning they could have changed or been deleted between the query and
+mutation. As such, it's best practice to return IDs from the query and
+re-validate invariants in the mutation when processing data that might be
+changed from other mutations. In the example above, for example, we fetch the
+latest value and check that the event still exists.
+
+If your batch data are not updated by other mutations, it's ok to pass values
+directly between the query and mutation. Tip: document these assumptions.
 
 ```ts
-// ✅ Query scans; mutation gets the data handed to it.
-return {
-  kind: "work" as const,
-  batch: { events: rows.map((e) => ({ id: e._id, value: e.value })) },
-};
+// Mutation: re-validate data before applying effects.
+for (const id of ids) {
+  const row = await ctx.db.get("tasks", id);
+  if (!row || row.state !== "pending") continue;
+  await ctx.db.patch("tasks", id, { state: "started" });
+  // Schedule work using the current row's values.
+}
 ```
+
+[^1]:
+    The query may (in the future) read an older database snapshot than the
+    mutation, though it will still read the writes of the previous round's
+    mutation. If a batch deletes rows or marks them started, the next query will
+    observe those changes to easily exclude that work from its results.
 
 ### Steering the loop dynamically
 
-Your worker mutation may return `{ debounceMs }` to throttle the loop, and a
-`cursor` to override the query's (see [The cursor](#the-cursor)):
+Your worker mutation may return `{ debounceMs }` to throttle the loop:
 
 ```ts
 return {
@@ -235,7 +243,10 @@ await ping(ctx, components.batchWorker, {
 The component stores the cursor for you: whatever your work query returns
 alongside a batch comes back as `args.cursor` on the next call. It's committed
 in the same transaction as the batch, so if your worker mutation throws, the
-cursor stays where it was and the batch is handed out again.
+cursor stays where it was and the next query attempt will see the old cursor.
+You can also return it from the mutation if you don't know how much progress
+will be made ahead of time
+([see below](#adjusting-the-cursor-from-the-worker-mutation)).
 
 The default cursor type is a
 [commit timestamp](https://docs.convex.dev/database/advanced/commit-timestamp)
@@ -256,26 +267,32 @@ await ctx.db.insert("myWork", { updatedAt: ctx.db.vars.commitTs, ... });
 await ctx.db.patch("myWork", id, { updatedAt: ctx.db.vars.commitTs, ... });
 ```
 
-Do **not** use `_creationTime`. It's assigned when a mutation _starts_, so a row
-inserted by a slow mutation can land _behind_ rows the worker has already
-queried past.
+Tip: if you're scanning documents inserted in the past 5 minutes, do **not** use
+`_creationTime`. It's assigned when a mutation _starts_, so a row inserted by a
+slow mutation can land _behind_ rows the worker has already queried, violating
+cursor invariants.
 
-**Scan with `gte`.** Everything a single mutation inserts shares one commit
-timestamp, so a batch can end in the middle of such a tie and the next scan has
-to start at the tie to pick up the rest. Re-reading from the tie costs at most
-one mutation's worth of already-processed rows.
+**Scan commit timestamps with `gte`.** Everything inserted in a single mutation
+shares one commit timestamp, so a query scanning a batch of work can end in the
+middle of such a tie. The next scan should then continue at the same commitTs
+that it ended on. Note: this implies that you have another mechanism to avoid
+dual-processing documents. If this isn't possible, see the next section on other
+cursor types.
 
-To end each batch on a tie boundary instead, read the remaining documents at
-that commit timestamp into the batch and scan with `gt`. That also processes
-work added "at once" together, as long as it fits in one transaction. See
+Alternatively, you could ensure that you process everything at a given commitTs
+together by reading the remaining documents from that shared timestamp. So long
+as you know it will all fit into a single query, this provides the extra benefit
+of having work committed together to be processed together, which can have
+consistency benefits. See
 [the aggregate example](./example/convex/aggregates.ts).
 
 #### Other cursor types
 
-The cursor can be any Convex value, for instance a `paginator` cursor from
-`convex-helpers`, which captures the index range
-`[commitTs, _creationTime, _id]` so you know exactly where you left off. Pass
-`cursor` to `defineBatchWorkerValidators` and all four validators pick it up:
+The cursor can be any Convex value, for instance a `streams` cursor from
+`convex-helpers`, to capture a specific index position
+`[commitTs, _creationTime, _id]` so you know exactly where you left off.
+
+You can customize the `cursor` type with `defineBatchWorkerValidators`:
 
 ```ts
 const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
@@ -284,9 +301,6 @@ const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
     cursor: v.string(),
   });
 ```
-
-`ping` takes the cursor's type from the work query's `cursor` arg and checks
-both return types against it, so a mismatch points at one place.
 
 #### Adjusting the cursor from the worker mutation
 
@@ -299,33 +313,34 @@ return { cursor: lastProcessed.updatedAt };
 ```
 
 If it is not returned, it will defer to the cursor returned by the work query,
-if one was returned, or keep the old value. Note: if the cursor does not advance
+or keep the old value if none was returned. Note: if the cursor does not advance
 and you did not update anything the query read, you may end up in an infinite
 loop.
 
 #### Reading and resetting the cursor
 
 The work query receives the cursor in its args. To read it elsewhere, say from a
-query counting pending work, call the component like `status`:
+query counting pending work, call the component's `getCursor` function:
 
 ```ts
-const from = ((await ctx.runQuery(components.batchWorker.lib.getCursor, {
+const cursor = await ctx.runQuery(components.batchWorker.lib.getCursor, {
   name: "events",
-})) ?? 0n) as bigint;
+});
 ```
 
-`lib.setCursor` overwrites it, and clears it when `cursor` is omitted, so the
-next scan starts from the front. Use it for migrations and recovery: the loop
-writes that document every iteration, so a call made while the worker is busy is
-liable to conflict. It throws if the worker doesn't exist yet (`ping` creates
-it).
+To overwrite it, call `lib.setCursor` with a new value. To clear it, call
+`lib.setCursor` with no value. Use it sparingly, e.g. for migrations and
+recovery. The loop writes that document every iteration, so a call made while
+the worker is busy is liable to conflict. Note: it throws if the worker doesn't
+exist yet (if `ping` hasn't been called).
 
 #### Why is a cursor necessary?
 
-The reason is due to a technical nuance of how Convex tracks document changes.
-Internally, Convex stores previous versions of documents in indexes for some
-time (~minutes). Old values will not be returned in results to JS, but it can
-slow down queries if they have to scan and discard thousands of these entries.
+The reason to track a cursor is because of a technical nuance of how Convex
+currently tracks document changes. Internally, Convex stores previous versions
+of documents in indexes for some time (~5 minutes, liable to change). Old values
+will not be returned in results to JS, but it can slow down queries if they have
+to scan and discard thousands of these entries.
 
 In the simple example above, a `.take(BATCH_SIZE)` from the front of a table
 followed by deleting all of those documents results in the beinning of the
@@ -335,6 +350,8 @@ before reaching the next batch of work.
 The solution is to keep a cursor to track your progress, and make your next
 query starting at the cursor, allowing it to skip over the region of the index
 full of previous versions or previously-handled work.
+
+[See this video for more details](https://youtu.be/pHrxmSjxLg8).
 
 ### Use Case: Updating denormalized aggregates
 
@@ -363,24 +380,22 @@ the value. If you need the fully-up-to-date value, you have a couple options:
 ### Use Case: Batching work with actions
 
 The worker mutation is a transaction, so it can't call external APIs itself. To
-batch work that requires `fetch`— calling an LLM, hitting a third-party API —
-have the worker mutation _claim_ a batch (mark the rows started so the query
-won't hand them out again) and then schedule the action, or enqueue it in a
-Workpool. The action does the work and calls a mutation to commit the results
-back.
+batch work that requires `fetch`, for example calling an LLM or hitting a
+third-party API, have the worker mutation _claim_ a batch: the query returns
+candidates to process, have the mutation validate those rows, mark them as
+"started", then enqueue the batch in a Workpool. The next round's query skips
+the claimed work. The action does the work and calls a mutation to commit the
+results back.
 
 Full working code is in [rateLimited.ts](./example/convex/rateLimited.ts). It
 also rate-limits the batches, covered next.
 
 Tip: if you use a Workpool, you can configure retries on the action, and commit
 the results or handle any error in the `onComplete` handler, which has the nice
-property of being called exactly once. You can pass through information about
-the batch in the `context` for the `onComplete` handler so you can update them
-even in the case of failure. It will also help you manage parallelism of async
-work, so live-site requests aren't impacted by spikey workloads.
-
-If you don't use a Workpool, you can detect failure of the scheduled job and
-manage retries yourself.
+property of being called exactly once. Pass through information about the batch
+in the `context` for the `onComplete` handler so you can update them even in the
+case of failure. It will also help you manage parallelism of async work, so
+live-site requests aren't impacted by background workloads.
 
 ### Rate limiting strategy
 
@@ -392,17 +407,12 @@ Full working code is in [rateLimited.ts](./example/convex/rateLimited.ts).
 
 Tips for rate-limiting LLM calls:
 
-- You can use the tokens returned from the previous LLM request to get accurate
-  token counts of the previous messages.
-- Consuming a rate limit after the request is a good trade-off for APIs that
-  have some grace around bursts of requests, and where you don't know the full
-  usage up-front. The post-request adjustment serves to delay future requests so
-  that your overall usage matches the rate limit, even if you temporarily go
-  above it.
-- By using the rate limiter's **reserve** functionality, it can avoid trial and
-  error: a reservation never rejects, but rather reserves future capacity if
-  necessary. It returns a `retryAfter` value instructing you how long to wait
-  before executing your request.
+- Use the rate limiter's **reserve** functionality to schedule work to happen in
+  the future if there is not enough capacity now. It avoids the trial and error
+  of checking a limit in a loop. Instead of rejecting, it reserves that capacity
+  and instructs when the request will be valid with a `retryAfter` value. After
+  waiting that duration, you make the request without checking the rate limit
+  again.
 - Use `retryAfter` two ways — to schedule the call for when you're actually
   allowed to make it, and as `debounceMs` to delay assembling the next batch.
 - The simplest version of this is to use `rateLimiter.check(ctx, name)` to
@@ -410,24 +420,34 @@ Tips for rate-limiting LLM calls:
   the limit based on the full usage using
   `rateLimiter.limit(ctx, name, { count: totalTokens, reserve: true })` after
   the request completes.
+- You can use the previous LLM response to get an accurate token count of the
+  previous request and combine it with an estimate for the current request as a
+  basis for estimating token usage.
 - For more accurate tracking, you can reserve capacity before the request based
   on **input** token estimations, then account for the **output** tokens
   afterwards, making a call with `reserve: true` from both places.
+- Consuming a rate limit after the request is a good trade-off for APIs that
+  have some grace around bursts of requests, and where you don't know the full
+  usage up-front. The post-request adjustment serves to delay future requests so
+  that your overall usage matches the rate limit, even if you temporarily go
+  above it.
 - If you'd rather delay the worker mutation until there's enough capacity, the
   work query can call `rateLimiter.check(...)` (read-only) and return
-  `{ kind: "idle", timeoutMs: retryAfter }` instead.
+  `{ kind: "idle", timeoutMs: retryAfter }` instead. This has the benefit of
+  letting more work accumulate for a batched request, or allowing skipping work
+  that gets canceled in the mean time.
 
 ### Failure handling
 
 If your work query or worker mutation throws, the loop dies and the liveness
-monitor restarts it after ~`monitorLagMs`. The unprocessed rows are still in
-your table and the cursor stayed where it was, so the query hands out the **same
-batch again**. That gives you at-least-once processing, but it also means one
-poison item that always throws can wedge the queue. For work that can fail per
-item, catch errors inside the worker mutation, and isolate bad docs in a table
-for async debugging.
+monitor restarts it after ~`monitorLagMs` (configurable via `ping`). The failed
+mutation's writes and any cursor changes roll back, so the query retries from
+the previous cursor. As a result, one poison item that causes a mutation to
+always throws can wedge the worker. Tip: for work that can fail per item, catch
+errors inside the worker mutation, and isolate bad docs in a table ("dead letter
+queue") for async debugging.
 
-This is a low-level primitive, relative to components like Workpool or Workflow,
+This is a low-level primitive relative to components like Workpool or Workflow,
 so you have to handle exceptional cases yourself.
 
 ### Stopping & resuming
@@ -492,6 +512,15 @@ See the full working examples in the example app:
 [example.ts](./example/convex/example.ts) (basic queue),
 [aggregates.ts](./example/convex/aggregates.ts) (denormalized aggregates), and
 [rateLimited.ts](./example/convex/rateLimited.ts) (async LLM batches).
+
+## Debugging
+
+- You can change the log level via an environment variable parameter to the
+  component. It defaults to "REPORT".
+
+```ts
+app.use(batchWorker, { env: { LOG_LEVEL: "REPORT" } });
+```
 
 <!-- END: Include on https://convex.dev/components -->
 

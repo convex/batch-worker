@@ -54,9 +54,7 @@ export const enqueue = mutation({
 const { vQueryArgs, vQueryReturns, vMutationArgs } =
   defineBatchWorkerValidators({
     batch: {
-      items: v.array(
-        v.object({ id: v.id("e2eEvents"), creationTime: v.number() }),
-      ),
+      ids: v.array(v.id("e2eEvents")),
     },
   });
 
@@ -76,10 +74,7 @@ export const getBatch = internalQuery({
     return {
       kind: "work" as const,
       batch: {
-        items: events.map((e) => ({
-          id: e._id,
-          creationTime: e._creationTime,
-        })),
+        ids: events.map((e) => e._id),
       },
       cursor: events.at(-1)!.updatedAt,
     };
@@ -88,9 +83,15 @@ export const getBatch = internalQuery({
 
 export const processBatch = internalMutation({
   args: vMutationArgs,
-  handler: async (ctx, { items }) => {
+  handler: async (ctx, { ids }) => {
+    // Match the queue example: measure only rows still present in this snapshot.
+    const candidates = await Promise.all(
+      ids.map((id) => ctx.db.get("e2eEvents", id)),
+    );
+    const items = candidates.filter((item) => item !== null);
+    if (items.length === 0) return;
     const now = Date.now();
-    const latencies = items.map((b) => now - b.creationTime);
+    const latencies = items.map((b) => now - b._creationTime);
     await ctx.db.insert("e2eSamples", {
       processedAt: now,
       batchSize: items.length,
@@ -98,7 +99,7 @@ export const processBatch = internalMutation({
       newestLatencyMs: Math.min(...latencies),
     });
     for (const b of items) {
-      await ctx.db.delete("e2eEvents", b.id);
+      await ctx.db.delete("e2eEvents", b._id);
     }
   },
 });

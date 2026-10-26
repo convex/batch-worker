@@ -14,6 +14,11 @@ import {
 // batches of them into per-team totals. Because exactly one loop runs at a
 // time, those hot aggregate rows have a single writer — so they never OCC
 // against each other or against incoming scores, no matter the rate.
+//
+// This example treats scoreEvents as immutable, append-only events. Passing
+// their values through the batch is safe under that assumption; an exclusive
+// cursor skips events already folded into the totals. If events can be edited
+// or deleted, return IDs and re-check their current state in the mutation.
 
 const WORKER = "aggregates";
 

@@ -68,16 +68,10 @@ export const submitRequest = mutation({
   },
 });
 
-// Carry everything the batch needs — including the prompt — so nothing has to
-// go back to the database to re-read it.
-const vLlmRequest = v.object({
-  id: v.id("llmRequests"),
-  prompt: v.string(),
-  inputTokens: v.number(),
-});
-
+// Return IDs so the mutation can check for changes by other mutations before
+// claiming each request, using its current prompt and token estimate.
 const { vQueryArgs, vQueryReturns, vMutationArgs, vMutationReturns } =
-  defineBatchWorkerValidators({ batch: { requests: v.array(vLlmRequest) } });
+  defineBatchWorkerValidators({ batch: { ids: v.array(v.id("llmRequests")) } });
 
 export const getBatch = internalQuery({
   args: vQueryArgs,
@@ -103,11 +97,7 @@ export const getBatch = internalQuery({
     return {
       kind: "work" as const,
       batch: {
-        requests: pending.map((r) => ({
-          id: r._id,
-          prompt: r.prompt,
-          inputTokens: r.inputTokens,
-        })),
+        ids: pending.map((r) => r._id),
       },
       // Rows come back in commit order, so the last one is how far we got.
       cursor: pending.at(-1)!.updatedAt,
@@ -122,7 +112,16 @@ export const getBatch = internalQuery({
 export const startBatch = internalMutation({
   args: vMutationArgs,
   returns: vMutationReturns,
-  handler: async (ctx, { requests }) => {
+  handler: async (ctx, { ids }) => {
+    // Other mutations may have changed, claimed, or deleted these requests
+    // since the query's snapshot. This worker's prior claims are already visible.
+    const candidates = await Promise.all(
+      ids.map((id) => ctx.db.get("llmRequests", id)),
+    );
+    const requests = candidates.filter(
+      (r): r is NonNullable<typeof r> => r !== null && r.state === "pending",
+    );
+    if (requests.length === 0) return null;
     const totalInputTokens = requests.reduce((a, r) => a + r.inputTokens, 0);
 
     // Reserve the whole batch's input tokens up front. `reserve: true` never
@@ -133,13 +132,13 @@ export const startBatch = internalMutation({
       reserve: true,
     });
 
-    // Mark them started so getBatch won't hand them out again. Every request
-    // in the batch gets claimed, so it's safe to move the cursor past them.
+    // Claim only requests that are still pending in this mutation's snapshot.
+    // The next round's query sees these claims and excludes them from pending.
     // Patches refresh `updatedAt` too, so the "started" range stays in claim
     // order for the recovery scan sketched in getBatch's TODO.
     const startedAt = Date.now();
-    for (const { id } of requests) {
-      await ctx.db.patch("llmRequests", id, {
+    for (const { _id } of requests) {
+      await ctx.db.patch("llmRequests", _id, {
         state: "started",
         startedAt,
         updatedAt: ctx.db.vars.commitTs,
@@ -152,7 +151,7 @@ export const startBatch = internalMutation({
       retryAfter ?? 0,
       internal.rateLimited.runBatch,
       {
-        prompts: requests.map((r) => ({ id: r.id, prompt: r.prompt })),
+        prompts: requests.map((r) => ({ id: r._id, prompt: r.prompt })),
       },
     );
 
