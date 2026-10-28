@@ -4,7 +4,7 @@ import { UpdateBanner } from "@convex-dev/static-hosting/react";
 import { api } from "../convex/_generated/api";
 import { useState } from "react";
 
-const REPO = "https://github.com/get-convex/batch-worker";
+const REPO = "https://github.com/convex/batch-worker";
 
 type WorkerStatus = { kind: "idle" | "running" | "stopped" } | null | undefined;
 
@@ -59,7 +59,7 @@ function App() {
             rateLimited.ts
           </a>
           . Hosted with{" "}
-          <a href="https://github.com/get-convex/static-hosting">
+          <a href="https://github.com/convex/static-hosting">
             @convex-dev/static-hosting
           </a>
           .
