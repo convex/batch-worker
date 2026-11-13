@@ -33,7 +33,7 @@ npm run dev:frontend # Vite dev server (second terminal)
 ## Deploy
 
 The demo is hosted on Convex with
-[`@convex-dev/static-hosting`](https://github.com/get-convex/static-hosting):
+[`@convex-dev/static-hosting`](https://github.com/convex/static-hosting):
 the component owns `/` and serves the built assets alongside the backend. These
 are one-off commands, so they aren't wired into `package.json`.
 
