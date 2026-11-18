@@ -27,11 +27,11 @@ After inserting work, call `ping(...)`. The component takes care of the rest:
   error), logging the failure so you can alert on it.
 
 This is the pattern behind components like
-[Workpool](https://github.com/get-convex/workpool), extracted so you can build
+[Workpool](https://github.com/convex/workpool), extracted so you can build
 your own "process a queue" components.
 
 Found a bug? Feature request?
-[File it here](https://github.com/get-convex/batch-worker/issues).
+[File it here](https://github.com/convex/batch-worker/issues).
 
 ## Installation
 
@@ -538,7 +538,7 @@ the Vite demo UI in [`example/src`](./example/src). It exercises all three
 workers — the basic queue, the live scoreboard, and the async LLM batches.
 
 The demo is hosted on Convex itself via
-[`@convex-dev/static-hosting`](https://github.com/get-convex/static-hosting),
+[`@convex-dev/static-hosting`](https://github.com/convex/static-hosting),
 published to `https://<deployment>.convex.site`. See
 [example/README.md](./example/README.md#deploy) for the deploy commands.
 
