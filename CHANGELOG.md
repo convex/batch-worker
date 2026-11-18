@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.7
+
+### Patch Changes
+
+- 4292317: Return the registered component API from the test helper and clarify
+  how work-query snapshots relate to worker mutations.
+
 ## 0.3.6
 
 - Updates the /test entrypoint for compatibility with convex-test's new
