@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.7
+
+### Patch Changes
+
+- Return the registered component API from the test helper and clarify how
+  work-query snapshots relate to worker mutations.
+  ([#30](https://github.com/convex/batch-worker/issues/30))
+
 ## 0.3.6
 
 - Updates the /test entrypoint for compatibility with convex-test's new
